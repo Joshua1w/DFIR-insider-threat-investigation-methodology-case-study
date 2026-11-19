@@ -1,0 +1,18 @@
+# Office lock / temp files
+~$*
+*.tmp
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor settings
+.vscode/
+.idea/
+
+# Never commit real case material produced by the scripts
+evidence/
+*.E01
+*.raw
+*.mem

@@ -1,0 +1,133 @@
+// =====================================================================================
+// Microsoft Defender XDR advanced hunting: queries for the illustrative case
+// -------------------------------------------------------------------------------------
+// Read-only hunting queries that rebuild parts of the case-study timeline from Defender
+// telemetry. Run each block on its own. Replace the placeholders first.
+//
+// - Advanced hunting keeps about 30 days. Export results (with a hash) early.
+// - Timestamps are UTC. The case-study timeline is in WAT (UTC+1).
+// - Each result *supports* a step in the timeline. Corroborate it with the host artefacts
+//   (LNK, USN, Prefetch, SRUM) and the server-side logs before relying on it.
+// - Tables need the relevant Defender for Endpoint / Office 365 / Cloud Apps licensing.
+// =====================================================================================
+
+// Placeholders: substitute these values in every query.
+// user:    "user@contoso.com"   (UPN / sender address)
+// account: "jdoe"               (SAM account name on the device)
+// device:  "WS-0421"            (workstation name)
+// window:  datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z)
+
+
+// -------------------------------------------------------------------------------------
+// 1. TRANSFER: outbound mail from the user to external recipients, with attachments
+//    (timeline 22:36 WAT)
+// -------------------------------------------------------------------------------------
+EmailEvents
+| where Timestamp between (datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where SenderFromAddress =~ "user@contoso.com"
+| where EmailDirection == "Outbound"
+| join kind=leftouter (
+    EmailAttachmentInfo
+    | project NetworkMessageId, FileName, FileType, FileSize, SHA256
+  ) on NetworkMessageId
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject,
+          FileName, FileType, FileSize, SHA256, NetworkMessageId
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 2. "IS THE ATTACHMENT THAT FILE?": match the attachment hash to a file created on
+//    the workstation (timeline 22:31 archive creation)
+// -------------------------------------------------------------------------------------
+let attachmentHashes =
+    EmailAttachmentInfo
+    | where Timestamp between (datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+    | where SenderFromAddress =~ "user@contoso.com"
+    | distinct SHA256;
+DeviceFileEvents
+| where Timestamp between (datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where DeviceName startswith "WS-0421"
+| where SHA256 in (attachmentHashes)
+| project Timestamp, DeviceName, ActionType, FolderPath, FileName, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 3. PREPARATION: export and archive activity on the workstation (timeline 22:24–22:31)
+// -------------------------------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp between (datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where DeviceName startswith "WS-0421"
+| where ActionType in ("FileCreated", "FileRenamed", "FileModified")
+| where FileName matches regex @"(?i)\.(xlsx|xls|csv|zip|7z|rar)$"
+| project Timestamp, ActionType, FolderPath, FileName, FileSize, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 4. SESSION: who logged on / unlocked, and how (timeline 21:52)
+//    A RemoteInteractive or CachedInteractive logon here would support the
+//    compromised-account hypothesis.
+// -------------------------------------------------------------------------------------
+DeviceLogonEvents
+| where Timestamp between (datetime(2026-11-09T19:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where DeviceName startswith "WS-0421"
+| project Timestamp, ActionType, LogonType, AccountDomain, AccountName,
+          RemoteIP, RemoteDeviceName, IsLocalAdmin, InitiatingProcessFileName
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 5. REMOTE CONTROL CHECK: remote-access tools running during the window
+// -------------------------------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp between (datetime(2026-11-09T19:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where DeviceName startswith "WS-0421"
+| where FileName in~ ("anydesk.exe", "teamviewer.exe", "tv_w32.exe", "tv_x64.exe",
+                      "screenconnect.clientservice.exe", "rustdesk.exe", "mstsc.exe",
+                      "rutserv.exe", "rfusclient.exe", "AteraAgent.exe", "ngrok.exe")
+| project Timestamp, FileName, FolderPath, ProcessCommandLine, AccountName,
+          InitiatingProcessFileName, SHA256
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 6. ALTERNATIVE ROUTES: USB mounts in the window (rules removable media in or out)
+// -------------------------------------------------------------------------------------
+DeviceEvents
+| where Timestamp between (datetime(2026-11-09T19:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where DeviceName startswith "WS-0421"
+| where ActionType == "UsbDriveMounted"
+| extend AF = parse_json(AdditionalFields)
+| project Timestamp, DriveLetter = tostring(AF.DriveLetter), ProductName = tostring(AF.ProductName),
+          SerialNumber = tostring(AF.SerialNumber), Manufacturer = tostring(AF.Manufacturer)
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 7. DELETION: mailbox clean-up after sending (timeline 22:38)
+// -------------------------------------------------------------------------------------
+CloudAppEvents
+| where Timestamp between (datetime(2026-11-09T20:30:00Z) .. datetime(2026-11-09T22:00:00Z))
+| where Application == "Microsoft Exchange Online"
+| where ActionType in ("SoftDelete", "HardDelete", "MoveToDeletedItems",
+                       "New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| where tostring(RawEventData.UserId) =~ "user@contoso.com"
+| project Timestamp, ActionType, AccountDisplayName, IPAddress, RawEventData
+| order by Timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// 8. EARLIER TRANSFERS ("still open" on slide 9): external mail with attachments from the
+//    user over the whole retention window, grouped by recipient domain
+// -------------------------------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(30d)
+| where SenderFromAddress =~ "user@contoso.com"
+| where EmailDirection == "Outbound" and AttachmentCount > 0
+| extend RecipientDomain = tostring(split(RecipientEmailAddress, "@")[1])
+| summarize Messages = count(), Attachments = sum(AttachmentCount),
+            First = min(Timestamp), Last = max(Timestamp) by RecipientDomain
+| order by Messages desc
